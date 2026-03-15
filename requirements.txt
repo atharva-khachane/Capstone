@@ -1,0 +1,56 @@
+# SL-RAG Pipeline Dependencies
+# Python 3.10+
+
+# Core ML/NLP
+torch>=2.0.0
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+accelerate>=0.20.0
+bitsandbytes>=0.41.0
+
+# Vector Store
+faiss-gpu>=1.7.2  # Use faiss-cpu if no GPU available
+
+# Document Processing
+PyMuPDF>=1.22.0  # PDF extraction
+pytesseract>=0.3.10  # OCR for scanned documents
+Pillow>=9.5.0  # Image processing
+
+# Retrieval
+rank-bm25>=0.2.2  # BM25 implementation
+scikit-learn>=1.3.0  # Clustering, metrics
+
+# Encryption & Security
+cryptography>=41.0.0  # AES-256 encryption
+
+# Data & Analytics
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# NLP (Optional - for name detection)
+spacy>=3.5.0
+# Run after install: python -m spacy download en_core_web_sm
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-benchmark>=4.0.0
+
+# Development Tools
+black>=23.7.0
+flake8>=6.1.0
+mypy>=1.5.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+click>=8.1.0
+
+# Monitoring
+psutil>=5.9.0
+
+# NLP sentence splitting
+nltk>=3.8.0

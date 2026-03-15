@@ -1,0 +1,19 @@
+# AI and other local model artifacts
+models/
+
+# Local environment/build artifacts
+venv/
+__pycache__/
+.pytest_cache/
+
+# Large/local data and docs
+data/
+storage/
+papers/
+*.pdf
+
+# Generated outputs and logs
+demo_output.json
+demo_output.txt
+test_results*.txt
+test_prompt_layer_results.json

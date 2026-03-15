@@ -1,0 +1,8 @@
+{
+    "manual_domain_mappings": {
+        "208B.pdf": "telemetry",
+        "20180000774.pdf": "telemetry",
+        "20020050369.pdf": "technical_report",
+        "20210017934 FINAL.pdf": "technical_report"
+    }
+}
