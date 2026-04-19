@@ -53,6 +53,9 @@ class MonitoringSystem:
         if self.encrypt_at_rest:
             self._hydrate_runtime_db()
         self._init_db()
+        # BUG FIX: seed _previous_hash from existing audit trail so the hash
+        # chain stays intact across multiple MonitoringSystem instantiations.
+        self._seed_previous_hash()
 
     # ------------------------------------------------------------------
     # Database setup
@@ -133,6 +136,24 @@ class MonitoringSystem:
         if self.encrypt_at_rest:
             self._persist_encrypted_db()
         print(f"[MONITOR] Database initialised at {self.db_path}")
+
+    def _seed_previous_hash(self) -> None:
+        """Seed _previous_hash from the last audit_trail row (if any).
+
+        Without this, every new MonitoringSystem instance resets the chain
+        to 'GENESIS', which breaks verify_audit_chain() when the DB already
+        has entries from a previous run.
+        """
+        try:
+            conn = self._connect()
+            c = conn.cursor()
+            c.execute("SELECT current_hash FROM audit_trail ORDER BY id DESC LIMIT 1")
+            row = c.fetchone()
+            conn.close()
+            if row:
+                self._previous_hash = row[0]
+        except Exception:
+            pass  # Fresh DB or unreadable — keep GENESIS
 
     def _hydrate_runtime_db(self) -> None:
         """Restore runtime sqlite DB from encrypted-at-rest bytes if present."""
@@ -258,17 +279,31 @@ class MonitoringSystem:
     # ------------------------------------------------------------------
 
     def _append_audit(self, operation: str, details: str) -> None:
+        """Atomically append a new audit entry, reading the last hash inside
+        the same exclusive transaction to prevent chain forking when multiple
+        processes write concurrently to the same SQLite database."""
         now = datetime.now().isoformat()
-        payload = f"{now}|{operation}|{details}|{self._previous_hash}"
-        current_hash = hashlib.sha256(payload.encode()).hexdigest()
 
         conn = self._connect()
+        # EXCLUSIVE transaction: no other writer can insert between our SELECT
+        # and INSERT, preventing concurrent processes from forking the chain.
+        conn.execute("BEGIN EXCLUSIVE")
         c = conn.cursor()
+
+        # Read the true last hash from the DB (not from in-memory cache) so
+        # concurrent processes never see the same _previous_hash.
+        c.execute("SELECT current_hash FROM audit_trail ORDER BY id DESC LIMIT 1")
+        row = c.fetchone()
+        previous_hash = row[0] if row else "GENESIS"
+
+        payload = f"{now}|{operation}|{details}|{previous_hash}"
+        current_hash = hashlib.sha256(payload.encode()).hexdigest()
+
         c.execute(
             "INSERT INTO audit_trail "
             "(timestamp, operation, details, previous_hash, current_hash) "
             "VALUES (?,?,?,?,?)",
-            (now, operation, details, self._previous_hash, current_hash),
+            (now, operation, details, previous_hash, current_hash),
         )
         conn.commit()
         conn.close()
@@ -345,7 +380,7 @@ class MonitoringSystem:
         }
 
     def get_security_summary(self) -> Dict[str, int]:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._connect()  # BUG FIX: was sqlite3.connect(str(self.db_path)) — wrong path when encrypted
         c = conn.cursor()
         c.execute("SELECT severity, COUNT(*) FROM security_events GROUP BY severity")
         rows = c.fetchall()

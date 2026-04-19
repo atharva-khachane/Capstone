@@ -349,6 +349,8 @@ class DocumentLoader:
         - JavaScript
         - Special control characters
         - Excessive whitespace
+
+        Also applies OCR artifact correction before final whitespace normalization.
         """
         # Remove HTML tags
         text = re.sub(r'<[^>]+>', '', text)
@@ -358,7 +360,10 @@ class DocumentLoader:
         
         # Remove control characters (except newlines and tabs)
         text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t')
-        
+
+        # Correct common OCR artifacts before whitespace normalization
+        text = self._correct_ocr_artifacts(text)
+
         # Normalize whitespace
         text = re.sub(r'\s+', ' ', text)
         text = re.sub(r'\n\s+\n', '\n\n', text)
@@ -366,6 +371,63 @@ class DocumentLoader:
         # Strip leading/trailing whitespace
         text = text.strip()
         
+        return text
+
+    # ------------------------------------------------------------------
+    # OCR artifact correction
+    # ------------------------------------------------------------------
+
+    # Number words that OCR frequently substitutes for numerals.
+    _NUMBER_WORDS: Dict[str, str] = {
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14",
+        "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18",
+        "nineteen": "19", "twenty": "20", "thirty": "30", "fifty": "50",
+    }
+
+    # Number word followed by a count/unit noun in procurement / financial text.
+    # Captures OCR patterns like "eight tenders", "two years", "fifteen percent".
+    _NUM_WORD_BEFORE_NOUN_RE = re.compile(
+        r'\b(one|two|three|four|five|six|seven|eight|nine|ten'
+        r'|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen'
+        r'|eighteen|nineteen|twenty|thirty|fifty)\b'
+        r'(?=\s+(?:tenders?|bids?|bidders?|firms?|proposals?|days?|weeks?|months?|years?'
+        r'|percent|%|lakh|crore|rupees?|copies|sets?|items?|units?|stages?|phases?))',
+        re.IGNORECASE,
+    )
+
+    # Ordinal number words preceding a noun (e.g. "eighth tender" → "8th tender")
+    _ORDINAL_WORDS: Dict[str, str] = {
+        "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th",
+        "fifth": "5th", "sixth": "6th", "seventh": "7th", "eighth": "8th",
+        "ninth": "9th", "tenth": "10th",
+    }
+    _ORDINAL_BEFORE_NOUN_RE = re.compile(
+        r'\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b'
+        r'(?=\s+(?:tenders?|bids?|bidders?|firms?|proposals?|stage|phase|item|copy|set))',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _correct_ocr_artifacts(cls, text: str) -> str:
+        """Replace common OCR number-word artifacts with numerals.
+
+        Only replaces number words that appear immediately before a count noun
+        or unit, which is the diagnostic context for OCR misreads in legal and
+        procurement documents (e.g. 'eight tenders' from a printed '8 tenders').
+        Plain number words in prose ('the two parties') are left untouched.
+        """
+        def _replace_cardinal(m: re.Match) -> str:
+            word = m.group(1).lower()
+            return cls._NUMBER_WORDS.get(word, m.group(1))
+
+        def _replace_ordinal(m: re.Match) -> str:
+            word = m.group(1).lower()
+            return cls._ORDINAL_WORDS.get(word, m.group(1))
+
+        text = cls._NUM_WORD_BEFORE_NOUN_RE.sub(_replace_cardinal, text)
+        text = cls._ORDINAL_BEFORE_NOUN_RE.sub(_replace_ordinal, text)
         return text
     
     def _generate_doc_id(self, content: str) -> str:

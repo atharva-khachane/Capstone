@@ -57,7 +57,7 @@ The system will support interactive, evidence-based analysis of:
    - Text extraction with layout preservation
    - Support for complex tables and multi-column layouts
 
-4. **Self-Hosted LLM**: ⏸️ **SKIP FOR NOW**
+4. **Self-Hosted LLM**: ⏸️  ***DONT SKIP THIS STEP Llama Is Already SET ****
    - Will be added in future phase after Llama 3.2 3B setup
    - For now, system returns retrieved chunks with citations
    - Focus on retrieval quality first

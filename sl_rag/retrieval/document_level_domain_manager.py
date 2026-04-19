@@ -179,8 +179,19 @@ class DocumentLevelDomainManager:
         query_embedding: np.ndarray,
         top_k_domains: int = 3,
         similarity_threshold: float = 0.3,
+        adaptive_threshold: bool = True,
     ) -> List[Tuple[str, float]]:
-        """Route a query to the most relevant domains via cosine similarity."""
+        """Route a query to the most relevant domains via cosine similarity.
+
+        When adaptive_threshold=True (default), computes an entropy-based
+        threshold instead of using the fixed similarity_threshold:
+
+            H = -Σ p_d * log(p_d)  (normalised by log(N_domains))
+            τ = base_tau * (0.5 + 0.5 * H_norm)
+
+        High entropy (uncertain query, scores spread evenly) → lower τ → wider net.
+        Low entropy (confident query, one dominant domain) → higher τ → stay focused.
+        """
         if not self.domains:
             return []
 
@@ -192,14 +203,51 @@ class DocumentLevelDomainManager:
         ]
         similarities.sort(key=lambda x: x[1], reverse=True)
 
+        if adaptive_threshold and len(similarities) >= 2:
+            threshold = self._compute_adaptive_threshold(
+                [s for _, s in similarities], base_tau=similarity_threshold
+            )
+        else:
+            threshold = similarity_threshold
+
         filtered = [
-            (d, s) for d, s in similarities if s >= similarity_threshold
+            (d, s) for d, s in similarities if s >= threshold
         ][:top_k_domains]
 
         if not filtered and similarities:
             filtered = [similarities[0]]
 
         return filtered
+
+    @staticmethod
+    def _compute_adaptive_threshold(
+        raw_scores: List[float],
+        base_tau: float = 0.3,
+    ) -> float:
+        """Compute entropy-based adaptive routing threshold.
+
+        Converts raw cosine scores to a probability distribution via
+        softmax, then uses normalised entropy to scale the threshold.
+
+        Args:
+            raw_scores: Cosine similarity scores (sorted desc).
+            base_tau: Base threshold (centre of the adaptive range).
+
+        Returns:
+            Adaptive threshold in (base_tau * 0.5, base_tau * 1.5).
+        """
+        import math
+        scores = np.array(raw_scores, dtype=np.float64)
+        # Softmax to get a probability distribution
+        exp_s = np.exp(scores - scores.max())
+        probs = exp_s / exp_s.sum()
+        # Shannon entropy normalised by log(N)
+        n = len(probs)
+        h_raw = -float(np.sum(probs * np.log(probs + 1e-12)))
+        h_norm = h_raw / math.log(n) if n > 1 else 0.0   # in [0, 1]
+        # When uncertain (h_norm≈1) → low τ; when certain (h_norm≈0) → high τ
+        tau = base_tau * (0.5 + 0.5 * h_norm)
+        return float(tau)
 
     def get_domain_stats(self) -> Dict[str, Any]:
         """Return per-domain and overall statistics."""

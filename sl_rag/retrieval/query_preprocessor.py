@@ -26,7 +26,7 @@ ACRONYM_MAP = {
     "RFQ":   "Request for Quotation RFQ",
     "NIT":   "Notice Inviting Tender NIT",
     "EOI":   "Expression of Interest EOI",
-    "EMD":   "Earnest Money Deposit EMD",
+    "EMD":   "Earnest Money Deposit EMD procurement tender bid security",
     "LOA":   "Letter of Acceptance LOA",
     "SOW":   "Scope of Work SOW",
     "TOR":   "Terms of Reference TOR",

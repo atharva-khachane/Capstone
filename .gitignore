@@ -1,10 +1,19 @@
 # AI and other local model artifacts
 models/
 
+# Node / frontend dependency & build artifacts
+node_modules/
+app/frontend/node_modules/
+app/frontend/dist/
+dist/
+
 # Local environment/build artifacts
 venv/
 __pycache__/
 .pytest_cache/
+
+# Local tool artifacts
+.deepeval/
 
 # Large/local data and docs
 data/
@@ -12,8 +21,23 @@ storage/
 papers/
 *.pdf
 
+# Generated figures / reports
+eval_figures/
+
+# Evaluation artifacts (keep scripts/config, ignore JSON outputs/datasets for now)
+evals/*.json
+
+# Secrets / API keys — NEVER commit
+.env
+.env.*
+
 # Generated outputs and logs
 demo_output.json
 demo_output.txt
 test_results*.txt
 test_prompt_layer_results.json
+eval_ragas_results.json
+eval_comprehensive_results.json
+
+# Avoid accidental root lockfile (frontend has its own lockfile)
+/package-lock.json

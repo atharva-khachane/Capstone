@@ -1,6 +1,9 @@
 # SL-RAG Pipeline Dependencies
 # Python 3.10+
 
+# LM Studio / OpenAI-compatible API client
+openai>=1.0.0
+
 # Core ML/NLP
 torch>=2.0.0
 sentence-transformers>=2.2.0

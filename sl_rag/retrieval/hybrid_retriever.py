@@ -9,7 +9,7 @@ The results are fused using weighted combination (Reciprocal Rank Fusion).
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import FrozenSet, List, Optional, Tuple
 from collections import defaultdict
 
 from ..core.schemas import Chunk
@@ -36,6 +36,11 @@ class HybridRetriever:
         fusion_method: 'weighted' or 'rrf' (Reciprocal Rank Fusion)
     """
     
+    # Domains with heavy technical vocabulary where BM25 is unreliable.
+    # When a query is filtered to one of these domains, alpha is boosted to
+    # tech_domain_alpha (default 0.95) for near-pure dense retrieval.
+    DEFAULT_TECH_DOMAINS: frozenset = frozenset({"telemetry", "technical_report"})
+
     def __init__(
         self,
         bm25_retriever: BM25Retriever,
@@ -44,21 +49,28 @@ class HybridRetriever:
         alpha: float = 0.7,
         fusion_method: str = 'weighted',
         enable_domain_filtering: bool = True,
+        tech_domain_alpha: float = 0.95,
+        tech_domains: Optional[List[str]] = None,
     ):
         self.bm25_retriever = bm25_retriever
         self.faiss_index = faiss_index
         self.embedding_generator = embedding_generator
-        self.alpha = alpha  # Weight for dense retrieval
+        self.alpha = alpha  # Weight for dense retrieval (Fix 5: configurable via bm25_alpha_param)
         self.fusion_method = fusion_method
         self.enable_domain_filtering = enable_domain_filtering
-        
+        self.tech_domain_alpha = tech_domain_alpha
+        self.tech_domains: frozenset = (
+            frozenset(tech_domains) if tech_domains else self.DEFAULT_TECH_DOMAINS
+        )
+
         # Build domain-specific indices for fast filtering
         self.domain_to_chunk_ids = {}
         if enable_domain_filtering:
             self._build_domain_indices()
-        
+
         print(f"[HYBRID] Initialized with alpha={alpha} ({int(alpha*100)}% dense, {int((1-alpha)*100)}% BM25)")
         print(f"[HYBRID] Fusion method: {fusion_method}")
+        print(f"[HYBRID] Tech domains: {sorted(self.tech_domains)} → alpha={tech_domain_alpha}")
         if enable_domain_filtering:
             print(f"[HYBRID] Domain filtering: ENABLED ({len(self.domain_to_chunk_ids)} domains)")
     
@@ -98,16 +110,26 @@ class HybridRetriever:
             valid_chunk_ids = set()
             for domain in filter_domains:
                 valid_chunk_ids.update(self.domain_to_chunk_ids.get(domain, set()))
-            
+
             if not valid_chunk_ids:
                 print(f"[HYBRID] WARNING: No chunks found in domains: {filter_domains}")
                 return []
-            
+
             print(f"[HYBRID] Filtering to {len(valid_chunk_ids)} chunks in domains: {filter_domains}")
-        
+
+        # Fix 2: Use dense-heavy alpha for technical vocabulary domains to avoid
+        # BM25 vocabulary mismatch on telemetry / technical-report queries.
+        effective_alpha = self.alpha
+        if filter_domains and self.tech_domains.intersection(filter_domains):
+            effective_alpha = self.tech_domain_alpha
+            print(
+                f"[HYBRID] Tech domain detected {filter_domains} — "
+                f"boosting alpha {self.alpha} → {effective_alpha}"
+            )
+
         # 1. BM25 retrieval
         bm25_results = self.bm25_retriever.search(query, top_k=top_k_candidates)
-        
+
         # 2. Dense retrieval
         query_embedding = self.embedding_generator.generate_query_embedding(query, normalize=True)
         dense_results = self.faiss_index.search(query_embedding, top_k=top_k_candidates)
@@ -117,11 +139,15 @@ class HybridRetriever:
             bm25_results = [(c, s) for c, s in bm25_results if c.chunk_id in valid_chunk_ids]
             dense_results = [(c, s) for c, s in dense_results if c.chunk_id in valid_chunk_ids]
         
-        # 4. Fuse results
+        # 4. Fuse results (using effective_alpha which may be boosted for tech domains)
         if self.fusion_method == 'rrf':
-            fused_results = self._reciprocal_rank_fusion(bm25_results, dense_results)
+            fused_results = self._reciprocal_rank_fusion(
+                bm25_results, dense_results, effective_alpha=effective_alpha
+            )
         else:  # weighted
-            fused_results = self._weighted_fusion(bm25_results, dense_results)
+            fused_results = self._weighted_fusion(
+                bm25_results, dense_results, effective_alpha=effective_alpha
+            )
         
         # 5. Return top-k
         return fused_results[:top_k]
@@ -130,6 +156,7 @@ class HybridRetriever:
         self,
         bm25_results: List[Tuple[Chunk, float]],
         dense_results: List[Tuple[Chunk, float]],
+        effective_alpha: Optional[float] = None,
     ) -> List[Tuple[Chunk, float]]:
         """
         Fuse results using weighted score combination.
@@ -159,6 +186,7 @@ class HybridRetriever:
             dense_scores[chunk.chunk_id] = max(0.0, min(1.0, score))
         
         # Combine scores
+        _alpha = effective_alpha if effective_alpha is not None else self.alpha
         all_chunk_ids = set(bm25_scores.keys()) | set(dense_scores.keys())
         combined_scores = {}
         chunk_map = {}
@@ -167,13 +195,13 @@ class HybridRetriever:
             chunk_map[chunk.chunk_id] = chunk
         for chunk, _ in dense_results:
             chunk_map[chunk.chunk_id] = chunk
-        
+
         for chunk_id in all_chunk_ids:
             bm25_score = bm25_scores.get(chunk_id, 0.0)
             dense_score = dense_scores.get(chunk_id, 0.0)
-            
-            # Weighted combination
-            combined_score = self.alpha * dense_score + (1 - self.alpha) * bm25_score
+
+            # Weighted combination (alpha = dense weight, 1-alpha = BM25 weight)
+            combined_score = _alpha * dense_score + (1 - _alpha) * bm25_score
             combined_scores[chunk_id] = combined_score
         
         # Sort by combined score
@@ -193,6 +221,7 @@ class HybridRetriever:
         bm25_results: List[Tuple[Chunk, float]],
         dense_results: List[Tuple[Chunk, float]],
         k: int = 60,
+        effective_alpha: Optional[float] = None,
     ) -> List[Tuple[Chunk, float]]:
         """
         Fuse results using Reciprocal Rank Fusion (RRF).
@@ -200,17 +229,18 @@ class HybridRetriever:
         RRF formula: score(d) = SUM[1 / (k + rank(d))]
         where k is a constant (usually 60) and rank is 1-indexed.
         """
+        _alpha = effective_alpha if effective_alpha is not None else self.alpha
         rrf_scores = defaultdict(float)
         chunk_map = {}
-        
+
         # Add BM25 results
         for rank, (chunk, _) in enumerate(bm25_results, start=1):
-            rrf_scores[chunk.chunk_id] += (1 - self.alpha) / (k + rank)
+            rrf_scores[chunk.chunk_id] += (1 - _alpha) / (k + rank)
             chunk_map[chunk.chunk_id] = chunk
-        
+
         # Add Dense results
         for rank, (chunk, _) in enumerate(dense_results, start=1):
-            rrf_scores[chunk.chunk_id] += self.alpha / (k + rank)
+            rrf_scores[chunk.chunk_id] += _alpha / (k + rank)
             chunk_map[chunk.chunk_id] = chunk
         
         # Sort by RRF score

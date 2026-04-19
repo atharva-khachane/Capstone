@@ -96,7 +96,30 @@ class CrossEncoderReranker:
         # Convert to list if numpy array
         if isinstance(scores, np.ndarray):
             scores = scores.tolist()
-        
+
+        # ms-marco cross-encoders output raw logits (~[-6, +6]).
+        # Apply sigmoid to map to a probability-like range.
+        import math
+        scores = [1.0 / (1.0 + math.exp(-s)) for s in scores]
+
+        # After sigmoid, relevant passages cluster in [0.65, 0.92], making
+        # avg_top3 non-discriminating in the confidence formula.  Min-max
+        # normalization within this result set stretches the scores to [0, 1]
+        # so the spread between the best and worst candidates is preserved.
+        #
+        # Minimum range guard: only normalize when the actual score spread is
+        # at least 0.05.  If all logits are uniformly high (e.g., every chunk
+        # is genuinely relevant to a clear query), the sigmoid outputs cluster
+        # within <0.05 of each other and normalization would amplify numerical
+        # noise into spurious [0, 1] extremes, producing false confidence
+        # scores near 1.0.  In that case, keep the raw sigmoid values so the
+        # confidence formula reflects the actual (high but not perfect) retrieval.
+        _MIN_NORM_RANGE = 0.05
+        if len(scores) > 1:
+            mn, mx = min(scores), max(scores)
+            if mx - mn >= _MIN_NORM_RANGE:
+                scores = [(s - mn) / (mx - mn) for s in scores]
+
         # Create re-ranked results
         reranked = [(chunk, float(score)) for chunk, score in zip(chunks, scores)]
         

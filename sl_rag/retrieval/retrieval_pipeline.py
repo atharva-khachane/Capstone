@@ -9,7 +9,7 @@ Orchestrates the complete retrieval process:
 5. Cross-encoder reranking
 """
 
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 from ..core.schemas import Chunk
@@ -19,6 +19,8 @@ from .hybrid_retriever import HybridRetriever
 from .reranker import CrossEncoderReranker
 from .query_preprocessor import QueryPreprocessor
 from .policy import RetrievalPolicy
+from .query_cache import QueryResultCache
+from .cross_chunk_resolver import CrossChunkResolver
 
 
 class RetrievalPipeline:
@@ -39,7 +41,10 @@ class RetrievalPipeline:
                  top_k_domains: int = 3,
                  rerank_candidates: int = 20,
                  final_top_k: int = 5,
-                 initial_top_k_candidates: int = 20):
+                 initial_top_k_candidates: int = 20,
+                 cache_ttl_seconds: int = 3600,
+                 cache_max_entries: int = 200,
+                 cache_enabled: bool = True):
         """
         Initialize retrieval pipeline.
         
@@ -51,6 +56,9 @@ class RetrievalPipeline:
             similarity_threshold: Min similarity for domain routing
             multi_domain_retrieval: Whether to retrieve from multiple domains
             top_k_domains: Number of domains to route to
+            cache_ttl_seconds: TTL for query result cache (0 = disable expiry)
+            cache_max_entries: Max distinct (query, top_k) entries in cache
+            cache_enabled: Whether to enable query result caching
         """
         self.embedding_generator = embedding_generator
         self.domain_manager = domain_manager
@@ -66,9 +74,18 @@ class RetrievalPipeline:
             final_top_k=final_top_k,
             initial_top_k_candidates=initial_top_k_candidates,
         )
-        
+        self._cache: Optional[QueryResultCache] = (
+            QueryResultCache(ttl_seconds=cache_ttl_seconds, max_entries=cache_max_entries)
+            if cache_enabled else None
+        )
+        # Fix 3: CrossChunkResolver removes near-duplicate adjacent chunks to
+        # improve context precision (deepEval context_precision metric).
+        self.cross_chunk_resolver = CrossChunkResolver(bucket_size=8, min_score_gap=0.0)
+
         print(f"[PIPELINE] Initialized multi-domain retrieval pipeline")
         print(f"[PIPELINE] Multi-domain: {multi_domain_retrieval}, Top-k domains: {top_k_domains}")
+        if self._cache:
+            print(f"[PIPELINE] Query cache: ENABLED (TTL={cache_ttl_seconds}s, max={cache_max_entries})")
     
     def retrieve(self, 
                  query: str, 
@@ -98,6 +115,13 @@ class RetrievalPipeline:
         
         # Step 0: Preprocess query (normalization + acronym expansion)
         query = self.query_preprocessor.preprocess(query)
+
+        # Cache check — return immediately on hit to avoid reranking overhead
+        if self._cache:
+            cached = self._cache.get(query, top_k)
+            if cached is not None:
+                print(f"[CACHE] Hit for query ({len(cached)} results) — {self._cache.stats()['hit_rate']:.0%} hit rate")
+                return cached
 
         # Step 1: Generate query embedding
         query_emb = self.embedding_generator.generate_query_embedding(query, normalize=True)
@@ -162,7 +186,26 @@ class RetrievalPipeline:
         
         if debug:
             print(f"[RETRIEVE] Total candidates: {len(results)}")
-        
+
+        # Fix 4: Fallback to full corpus when domain routing yields too few results.
+        # This handles cases where clustering assigns tech documents to unexpected
+        # domain names (e.g. "figure_procurement") and filtered retrieval returns 0.
+        if len(results) < top_k:
+            if debug or len(results) == 0:
+                print(f"[RETRIEVE] Only {len(results)} results from domain routing, "
+                      f"falling back to full corpus")
+            fallback = self.hybrid_retriever.search(
+                query=query,
+                top_k=max(top_k * 3, self.policy.initial_top_k_candidates),
+                top_k_candidates=max(top_k * 4, self.policy.initial_top_k_candidates),
+                filter_domains=None,
+            )
+            seen_ids = {chunk.chunk_id for chunk, _ in results}
+            for chunk, score in fallback:
+                if chunk.chunk_id not in seen_ids:
+                    seen_ids.add(chunk.chunk_id)
+                    results.append((chunk, score))
+
         # Step 4: Filter by similarity threshold (optional)
         # For hybrid scores, we might skip this as scores are already normalized
         
@@ -170,20 +213,65 @@ class RetrievalPipeline:
         if enable_reranking and self.cross_encoder and results:
             if debug:
                 print(f"[RERANK] Reranking {len(results)} candidates...")
-            
-            # Take top candidates for reranking
+
             target_top_k = self.policy.resolve_top_k(top_k)
             rerank_candidates = results[:self.policy.candidate_window(len(results))]
             reranked = self.cross_encoder.rerank(query, rerank_candidates, top_k=target_top_k)
-            
+
             if debug:
                 print(f"[RERANK] Returned top-{len(reranked)} results")
-            
+
+            # Fix 4b: prevent cross-domain context dilution
+            reranked = self._consolidate_sources(reranked)
+
+            # Fix 3: de-duplicate overlapping chunks to improve context precision
+            reranked = self.cross_chunk_resolver.resolve(reranked)[:target_top_k]
+
+            if self._cache:
+                self._cache.put(query, top_k, reranked)
             return reranked
-        
+
         # Return top-k without reranking
-        return results[:self.policy.resolve_top_k(top_k)]
+        final = results[:self.policy.resolve_top_k(top_k)]
+        if self._cache:
+            self._cache.put(query, top_k, final)
+        return final
     
+    def _consolidate_sources(
+        self,
+        results: List[Tuple[Chunk, float]],
+    ) -> List[Tuple[Chunk, float]]:
+        """Keep only the best domain group when results span multiple domains.
+
+        Prevents context dilution from incompatible document clusters
+        (e.g. mixing financial rules with procurement in a single context window).
+        Only consolidates when one domain clearly dominates (>60% of aggregate
+        score); otherwise keeps all results to allow genuine multi-domain answers.
+        """
+        if len(results) <= 1:
+            return results
+
+        domain_groups: Dict[str, List[Tuple[Chunk, float]]] = defaultdict(list)
+        for chunk, score in results:
+            domain_groups[chunk.domain or "unknown"].append((chunk, score))
+
+        if len(domain_groups) <= 1:
+            return results
+
+        domain_scores = {
+            d: sum(s for _, s in grp) for d, grp in domain_groups.items()
+        }
+        total = sum(domain_scores.values())
+        if total <= 0:
+            return results
+
+        best = max(domain_scores, key=domain_scores.get)
+
+        if domain_scores[best] / total > 0.6 and len(domain_groups[best]) >= 2:
+            return domain_groups[best]
+
+        return results
+
     def retrieve_with_domain_stats(self,
                                    query: str,
                                    top_k: int = 5,
