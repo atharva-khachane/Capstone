@@ -412,8 +412,13 @@ class SLRAGPipeline:
         top1_retrieval = max((s for _, s in generation_results), default=0.0)
         groundedness = answer_validation.get("faithfulness_score", 0.0) or 0.0
         ctx_precision = answer_validation.get("consistency_score", 0.0) or 0.0
+        ctx_recall = (
+            answer_validation.get("context_recall")
+            or answer_validation.get("contextual_recall")
+            or 0.0
+        )
         calibrated_confidence = compute_rule_based_confidence(
-            top1_retrieval, groundedness, ctx_precision
+            top1_retrieval, groundedness, ctx_precision, ctx_recall
         )
 
         display_answer = answer
@@ -663,8 +668,13 @@ class SLRAGPipeline:
         _stream_top1 = max((s for _, s in generation_results), default=0.0)
         _stream_ground = answer_validation.get("faithfulness_score", 0.0) or 0.0
         _stream_ctx = answer_validation.get("consistency_score", 0.0) or 0.0
+        _stream_recall = (
+            answer_validation.get("context_recall")
+            or answer_validation.get("contextual_recall")
+            or 0.0
+        )
         _stream_conf = compute_rule_based_confidence(
-            _stream_top1, _stream_ground, _stream_ctx
+            _stream_top1, _stream_ground, _stream_ctx, _stream_recall
         )
 
         done_payload = {

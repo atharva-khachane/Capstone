@@ -123,13 +123,18 @@ sys.stderr = sys.__stderr__
 print("[EVAL] Pipeline ready [OK]")
 
 # ── Load dataset from CSV ─────────────────────────────────────────────────────
-EVAL_CSV = "slrag_expanded_queries_v1.csv"
-if not Path(EVAL_CSV).exists():
-    print(f"[ERROR] {EVAL_CSV} not found. Place the evaluation CSV in the project root.")
+EVAL_CSV_CANDIDATES = [
+    Path("slrag_expanded_queries_v1.csv"),
+    Path("eval_figures") / "slrag_expanded_queries_v1.csv",
+]
+EVAL_CSV_PATH = next((p for p in EVAL_CSV_CANDIDATES if p.exists()), None)
+if EVAL_CSV_PATH is None:
+    locations = ", ".join(str(p) for p in EVAL_CSV_CANDIDATES)
+    print(f"[ERROR] slrag_expanded_queries_v1.csv not found. Looked in: {locations}")
     sys.exit(1)
 
 eval_data: list = []
-with open(EVAL_CSV, encoding="utf-8") as f:
+with open(EVAL_CSV_PATH, encoding="utf-8") as f:
     reader = csv.DictReader(f)
     for row in reader:
         eval_data.append({
@@ -164,7 +169,7 @@ if _only_ids_raw:
         if missing_ids:
             print(f"[WARN] EVAL_ONLY_IDS not found in dataset: {', '.join(missing_ids)}")
 
-print(f"[EVAL] Loaded {len(eval_data)} queries from {EVAL_CSV}")
+print(f"[EVAL] Loaded {len(eval_data)} queries from {EVAL_CSV_PATH}")
 print(f"[EVAL] {len(normal_items)} normal queries, {len(adversarial_items)} adversarial")
 
 # ── Domain → source filename keyword map ─────────────────────────────────────
@@ -415,32 +420,46 @@ if _bert_ok and any(answers):
     for j, i in enumerate(valid_idx):
         per_query_bert[i] = round(float(F1[j]), 4)
 
-# 9. ECE — rule-based confidence vs ROUGE-L accuracy (Fix 1)
+# 9. ECE — rule-based confidence vs semantic correctness (BERTScore F1)
 N_BINS = 5
 confs = [r.get("confidence", 0.5) for r in responses]
-if _rouge_ok and any(answers):
-    correctness = [
-        _rouge.score(gt, ans)["rougeL"].fmeasure
-        for ans, gt in zip(answers, ground_truths)
+if _bert_ok and any(answers):
+    valid_for_ece = [
+        i for i, (ans, gt) in enumerate(zip(answers, ground_truths))
+        if ans and gt and per_query_bert[i] is not None
     ]
-
-    metrics["ece"] = _compute_ece_helper(confs, correctness, N_BINS)
+    if valid_for_ece:
+        correctness = [per_query_bert[i] for i in valid_for_ece]
+        confs_ece = [confs[i] for i in valid_for_ece]
+        metrics["ece"] = _compute_ece_helper(confs_ece, correctness, N_BINS)
+    else:
+        metrics["ece"] = None
 
     conf_range = max(confs) - min(confs) if confs else 0
-    print(f"  ECE (rule-based) = {metrics['ece']}")
+    print(f"  ECE (rule-based vs BERTScore F1) = {metrics['ece']}")
     print(f"  Confidence range = {conf_range:.3f}  (min={min(confs):.3f}, max={max(confs):.3f})")
-    if metrics["ece"] < 0.35:
-        print(f"  [CALIBRATION] [OK] ECE < 0.35 target met")
-    else:
-        print(f"  [CALIBRATION] WARNING: ECE={metrics['ece']:.4f} still >= 0.35")
+    if metrics["ece"] is not None:
+        if metrics["ece"] < 0.35:
+            print(f"  [CALIBRATION] [OK] ECE < 0.35 target met")
+        else:
+            print(f"  [CALIBRATION] WARNING: ECE={metrics['ece']:.4f} still >= 0.35")
     if conf_range < 0.4:
         print(f"  [CALIBRATION] WARNING: confidence range {conf_range:.3f} < 0.4 target")
     else:
         print(f"  [CALIBRATION] [OK] confidence range >= 0.4")
 else:
-    metrics["ece"] = None
-    confs = [0.5] * len(responses)
-    print(f"  ECE = {metrics['ece']}")
+    # Fallback: if BERTScore isn't available, use ROUGE-L rather than skipping.
+    if _rouge_ok and any(answers):
+        correctness = [
+            _rouge.score(gt, ans)["rougeL"].fmeasure
+            for ans, gt in zip(answers, ground_truths)
+        ]
+        metrics["ece"] = _compute_ece_helper(confs, correctness, N_BINS)
+        print(f"  ECE (fallback vs ROUGE-L) = {metrics['ece']}")
+    else:
+        metrics["ece"] = None
+        confs = [0.5] * len(responses)
+        print(f"  ECE = {metrics['ece']}")
 
 # 10. Hallucination rate
 high_hall = [r for r in responses if r.get("hallucination_risk") == "high"]
